@@ -1,6 +1,6 @@
 # Toutui — Full Code Review
 
-**What the project is:** a Rust TUI client for Audiobookshelf (ratatui + crossterm + tokio + reqwest + rusqlite) that browses books/podcasts and plays them via a locally-launched VLC controlled over VLC's RC TCP port. State (token, user prefs, last listening session) lives in a SQLite DB under `~/.config/toutui`, and an install/update flow runs a remote bash script. The repo is self-declared archived/beta, which explains (but doesn't excuse) the state below.
+**What the project is:** a Rust TUI client for Audiobookshelf (ratatui + crossterm + tokio + reqwest + rusqlite) that browses books/podcasts and plays them via a locally-launched VLC controlled over VLC's RC TCP port. State (token, user prefs, last listening session) lives in a SQLite DB under `~/.config/toutui`, and an install/update flow runs a remote bash script. The project was originally released as an archived beta; it is now maintained again (originally by AlbanDAVID, see README), which makes the findings below worth addressing.
 
 ---
 
@@ -70,6 +70,14 @@ Install script reads the key with plain `read` (echoed on screen) and writes `.e
 
 ---
 
+## 🔎 External review: ABS API usage (issue #35)
+
+[AlbanDAVID/Toutui#35](https://github.com/AlbanDAVID/Toutui/issues/35) — filed by Vito0912, a contributor who audits third-party ABS clients for correct API usage. It was never addressed while the repo lay archived, and all three points apply to the current code. Verified against the codebase and ABS upstream:
+
+1. **Playback passes the raw token to VLC (insecure)** — ABS added a more secure way to play files that doesn't require transmitting the API token to fetch the media (this is what the web client and official apps do). Toutui instead appends `?token=<full API token>` to the stream URL and hands it to VLC as a command-line argument (`src/player/vlc/start_vlc.rs`) — see Security #1. Fix: use the token-free/signed media URLs returned by the play endpoint in current ABS versions.
+2. **Sends `/sync` and `/progress` for the same update** — on every ~10 s tick `handle_l_book` / `handle_l_pod` / `handle_l_pod_home` call both `sync_session()` *and* `update_media_progress_*()`, and again on the quit/finish paths (`sync_session_from_database.rs` does the same). `/sync` already updates progress and is the correct endpoint for continuous playback updates; `/progress` is for user-initiated changes from the UI (discharge progress, mark finished, set custom progress). Sending both can cause race conditions that leave items stuck in "Continue Listening", and `/progress` doesn't emit websockets so other connected clients won't see the change. This is confirmed by ABS upstream ([advplyr/audiobookshelf#4977](https://github.com/advplyr/audiobookshelf/issues/4977): "the progress endpoint is not the correct endpoint for continuously updating progress… incorrectly using that endpoint causes issues with the official clients due to not emitting the websocket"). It is also a likely contributor to the sync bugs in `known_bugs.md`. Note the call order is even inconsistent: book handlers call sync-then-progress, podcast handlers call progress-then-sync.
+3. **Loads the entire library with no pagination** — `get_all_books()` requests `?limit=0` (all items) and `App::new` then also fetches every podcast's episodes (`get_pod_ep` per item, sequentially). On libraries with 1000–10000+ items this is slow, RAM-hungry, and puts real load on the user's self-hosted server, on every launch and every `R`-refresh. Fix: use `limit`/`offset` pagination (or at least a sane `limit` + server-side sort), and only fetch episode lists lazily when a podcast is opened (relates to Design #2).
+
 ## 🛠 Design / things that could be better
 
 1. **`App` is a 90-field god struct** holding ~40 parallel lists per view, with three nearly identical `handle_l_*` functions (~250 lines each, copy-pasted with subtle differences) and 15+ CRUD functions that each re-derive the DB path. Extract a `PlayerSession` type (id_session, id_item, duration, …), a single `handle_play()` parameterized by view, and a `Db` handle opened once.
@@ -86,10 +94,11 @@ Install script reads the key with plain `read` (echoed on screen) and writes `.e
 
 ---
 
-## Suggested priority if you ever un-archive this
+## Suggested priority for fixes
 
-1. Token out of the VLC command line (Security #1) and fix the install-script trust chain + Linux `sha256sum` (Security #3, #18) — user-facing security.
-2. Kill the panic paths: `render_player` short-vec, `select_last` underflow, `unwrap()`/`parse().unwrap()` on API strings, config color validation (Bugs #1, #2, #8, #12).
-3. Fix the `pseudo_escape_line` typo (#17) — it silently destroys user configs on every update.
-4. Make Q robust (read `should_exit` in `main`, or return from the sync task) and bound `wait_prev_session_finished` with a timeout (#3, #4).
-5. Then the structural work: shared HTTP client with timeouts, dedupe playback handlers, DB handle + migrations, and unit tests.
+1. Token out of the VLC command line (Security #1, also issue #35 point 1 — use ABS's token-free media URLs) and fix the install-script trust chain + Linux `sha256sum` (Security #3, #18) — user-facing security.
+2. Fix API usage per issue #35: stop sending both `/sync` and `/progress` (keep `/sync` for playback, `/progress` for UI actions only), and paginate `get_all_books` instead of `?limit=0`.
+3. Kill the panic paths: `render_player` short-vec, `select_last` underflow, `unwrap()`/`parse().unwrap()` on API strings, config color validation (Bugs #1, #2, #8, #12).
+4. Fix the `pseudo_escape_line` typo (#17) — it silently destroys user configs on every update.
+5. Make Q robust (read `should_exit` in `main`, or return from the sync task) and bound `wait_prev_session_finished` with a timeout (#3, #4).
+6. Then the structural work: shared HTTP client with timeouts, dedupe playback handlers, DB handle + migrations, and unit tests.
